@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from dataclasses import dataclass
 from vggt.utils.pose_enc import extri_intri_to_pose_encoding
-from train_utils.general import check_and_fix_inf_nan
+from training.train_utils.general import check_and_fix_inf_nan
 from math import ceil, floor
 
 
@@ -251,9 +251,10 @@ def compute_depth_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_f
     pred_depth = predictions['depth']
     pred_depth_conf = predictions['depth_conf']
 
-    gt_depth = batch['depths']
+    gt_depth = batch['depth']
     gt_depth = check_and_fix_inf_nan(gt_depth, "gt_depth")
-    gt_depth = gt_depth[..., None]              # (B, H, W, 1)
+    if len(gt_depth.shape) == 4:
+        gt_depth = gt_depth[..., None]              # (B, S, H, W, 1)
     gt_depth_mask = batch['point_masks'].clone()   # 3D points derived from depth map, so we use the same mask
 
     if gt_depth_mask.sum() < 100:
