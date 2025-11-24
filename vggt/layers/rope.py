@@ -61,19 +61,8 @@ class PositionGetter:
 
 class RotaryPositionEmbedding2D(nn.Module):
     """2D Rotary Position Embedding implementation.
-
-    This module applies rotary position embeddings to input tokens based on their
-    2D spatial positions. It handles the position-dependent rotation of features
-    separately for vertical and horizontal dimensions.
-
-    Args:
-        frequency: Base frequency for the position embeddings. Default: 100.0
-        scaling_factor: Scaling factor for frequency computation. Default: 1.0
-
-    Attributes:
-        base_frequency: Base frequency for computing position embeddings.
-        scaling_factor: Factor to scale the computed frequencies.
-        frequency_cache: Cache for storing precomputed frequency components.
+    
+    Fixed for torch.compile() compatibility.
     """
 
     def __init__(self, frequency: float = 100.0, scaling_factor: float = 1.0):
@@ -82,22 +71,23 @@ class RotaryPositionEmbedding2D(nn.Module):
         self.base_frequency = frequency
         self.scaling_factor = scaling_factor
         self.frequency_cache: Dict[Tuple, Tuple[torch.Tensor, torch.Tensor]] = {}
+        
+        # A static buffer size for compilation mode. 
+        # 8192 covers up to ~90x90 patch grids, which is huge (approx 1260x1260 pixels)
+        self.MAX_STATIC_CACHE = 8192 
 
     def _compute_frequency_components(
         self, dim: int, seq_len: int, device: torch.device, dtype: torch.dtype
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Computes frequency components for rotary embeddings.
-
-        Args:
-            dim: Feature dimension (must be even).
-            seq_len: Maximum sequence length.
-            device: Target device for computations.
-            dtype: Data type for the computed tensors.
-
-        Returns:
-            Tuple of (cosine, sine) tensors for frequency components.
         """
+        # We assume that if the requested seq_len is already cached, we return it.
+        # But we also need to handle the case where we requested a smaller size 
+        # previously but now need a larger one.
+        
+        # Simplification: The cache key includes seq_len, so it is exact match.
         cache_key = (dim, seq_len, device, dtype)
+        
         if cache_key not in self.frequency_cache:
             # Compute frequency bands
             exponents = torch.arange(0, dim, 2, device=device).float() / dim
@@ -118,14 +108,7 @@ class RotaryPositionEmbedding2D(nn.Module):
 
     @staticmethod
     def _rotate_features(x: torch.Tensor) -> torch.Tensor:
-        """Performs feature rotation by splitting and recombining feature dimensions.
-
-        Args:
-            x: Input tensor to rotate.
-
-        Returns:
-            Rotated feature tensor.
-        """
+        """Performs feature rotation by splitting and recombining feature dimensions."""
         feature_dim = x.shape[-1]
         x1, x2 = x[..., : feature_dim // 2], x[..., feature_dim // 2 :]
         return torch.cat((-x2, x1), dim=-1)
@@ -133,18 +116,9 @@ class RotaryPositionEmbedding2D(nn.Module):
     def _apply_1d_rope(
         self, tokens: torch.Tensor, positions: torch.Tensor, cos_comp: torch.Tensor, sin_comp: torch.Tensor
     ) -> torch.Tensor:
-        """Applies 1D rotary position embeddings along one dimension.
-
-        Args:
-            tokens: Input token features.
-            positions: Position indices.
-            cos_comp: Cosine components for rotation.
-            sin_comp: Sine components for rotation.
-
-        Returns:
-            Tokens with applied rotary position embeddings.
-        """
-        # Embed positions with frequency components
+        """Applies 1D rotary position embeddings along one dimension."""
+        # F.embedding handles the lookup. 
+        # As long as 'positions' values are < 'cos_comp' length, this works.
         cos = F.embedding(positions, cos_comp)[:, None, :, :]
         sin = F.embedding(positions, sin_comp)[:, None, :, :]
 
@@ -153,18 +127,6 @@ class RotaryPositionEmbedding2D(nn.Module):
 
     def forward(self, tokens: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """Applies 2D rotary position embeddings to input tokens.
-
-        Args:
-            tokens: Input tensor of shape (batch_size, n_heads, n_tokens, dim).
-                   The feature dimension (dim) must be divisible by 4.
-            positions: Position tensor of shape (batch_size, n_tokens, 2) containing
-                      the y and x coordinates for each token.
-
-        Returns:
-            Tensor of same shape as input with applied 2D rotary position embeddings.
-
-        Raises:
-            AssertionError: If input dimensions are invalid or positions are malformed.
         """
         # Validate inputs
         assert tokens.size(-1) % 2 == 0, "Feature dimension must be even"
@@ -173,14 +135,39 @@ class RotaryPositionEmbedding2D(nn.Module):
         # Compute feature dimension for each spatial direction
         feature_dim = tokens.size(-1) // 2
 
-        # Get frequency components
-        max_position = int(positions.max()) + 1
-        cos_comp, sin_comp = self._compute_frequency_components(feature_dim, max_position, tokens.device, tokens.dtype)
+        # --- FIX STARTS HERE ---
+        # Determining the max_position determines the size of the lookup table.
+        
+        # Check if we are compiling (Dynamo/Inductor)
+        is_compiling = torch.compiler.is_compiling()
+        
+        if is_compiling:
+            # OPTIMIZATION: When compiling, we cannot look at data (.max()).
+            # Instead, we request a large, fixed-size table (e.g., 8192).
+            # F.embedding will simply look up indices in this large table.
+            max_position = self.MAX_STATIC_CACHE
+        else:
+            # EAGER MODE: We can look at data to save memory.
+            # We calculate the exact size needed.
+            max_position = int(positions.max()) + 1
+            
+            # (Optional) If you switch between modes, you might want to force 
+            # the static size even in eager mode to hit the same cache key.
+            # But the logic below works fine.
+
+        # Get frequency components (Look up or compute table of size 'max_position')
+        cos_comp, sin_comp = self._compute_frequency_components(
+            feature_dim, max_position, tokens.device, tokens.dtype
+        )
+        
+        # --- FIX ENDS HERE ---
 
         # Split features for vertical and horizontal processing
         vertical_features, horizontal_features = tokens.chunk(2, dim=-1)
 
         # Apply RoPE separately for each dimension
+        # Note: positions[..., 0] contains integers. If any integer is >= max_position, this crashes.
+        # But since we set max_position=8192 during compile, it handles any coord < 8192.
         vertical_features = self._apply_1d_rope(vertical_features, positions[..., 0], cos_comp, sin_comp)
         horizontal_features = self._apply_1d_rope(horizontal_features, positions[..., 1], cos_comp, sin_comp)
 
