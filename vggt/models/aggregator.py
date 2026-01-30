@@ -257,6 +257,43 @@ class Aggregator(nn.Module):
         del global_intermediates
         return output_list, self.patch_start_idx
 
+    @torch.no_grad()
+    def get_dino_features(self, images: torch.Tensor) -> torch.Tensor:
+        """
+        Extract raw DINO features without any attention processing.
+        
+        These are view-invariant features directly from the DINOv2 backbone,
+        before any cross-frame attention in VGGT. Useful for cross-view matching
+        and as skip connections.
+        
+        Args:
+            images (torch.Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
+                B: batch size, S: sequence length, 3: RGB channels, H: height, W: width
+                
+        Returns:
+            torch.Tensor: DINO patch tokens with shape [B, S, P, C]
+                P: number of patches, C: embed_dim (1024 for ViT-L)
+        """
+        B, S, C_in, H, W = images.shape
+        
+        if C_in != 3:
+            raise ValueError(f"Expected 3 input channels, got {C_in}")
+        
+        # Normalize images
+        images = (images - self._resnet_mean) / self._resnet_std
+        
+        # Reshape to [B*S, C, H, W] for patch embedding
+        images = images.view(B * S, C_in, H, W)
+        patch_tokens = self.patch_embed(images)
+        
+        if isinstance(patch_tokens, dict):
+            patch_tokens = patch_tokens["x_norm_patchtokens"]
+        
+        _, P, C = patch_tokens.shape
+        
+        # Reshape to [B, S, P, C]
+        return patch_tokens.view(B, S, P, C)
+
     def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
         """
         Process frame attention blocks. We keep tokens in shape (B*S, P, C).
